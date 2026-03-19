@@ -13,18 +13,6 @@
 #include <stdint.h>
 #include <string.h>
 
-// [PATCH] Hilog for layer-level tracing
-#ifdef __OHOS__
-#include <hilog/log.h>
-#define NET_HILOG(fmt, ...) do { \
-    char _nhbuf[512]; \
-    snprintf(_nhbuf, sizeof(_nhbuf), fmt, ##__VA_ARGS__); \
-    OH_LOG_Print(LOG_APP, LOG_INFO, 0x3202, "NcnnNet", "%{public}s", _nhbuf); \
-} while(0)
-#else
-#include <stdio.h>
-#define NET_HILOG(fmt, ...) fprintf(stderr, "[NcnnNet] " fmt "\n", ##__VA_ARGS__)
-#endif
 
 #if NCNN_BENCHMARK
 #include "benchmark.h"
@@ -240,8 +228,6 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std:
 {
     const Layer* layer = layers[layer_index];
 
-    NET_HILOG("[NET] forward_layer[%d] %s vulkan=%d", layer_index, layer->name.c_str(), (int)layer->support_vulkan);
-
     bool cmd_submit_and_wait = false;
 
     // load bottom blobs
@@ -321,7 +307,6 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std:
 #if NCNN_BENCHMARK
         cmd.record_write_timestamp(layer_index * 2);
 #endif
-        NET_HILOG("[NET] do_forward_layer[%d] %s GPU start", layer_index, layer->name.c_str());
         if (layer->featmask)
         {
             ret = do_forward_layer(layer, blob_mats_gpu, cmd, get_masked_option(opt, layer->featmask));
@@ -330,7 +315,6 @@ int NetPrivate::forward_layer(int layer_index, std::vector<Mat>& blob_mats, std:
         {
             ret = do_forward_layer(layer, blob_mats_gpu, cmd, opt);
         }
-        NET_HILOG("[NET] do_forward_layer[%d] %s GPU done ret=%d", layer_index, layer->name.c_str(), ret);
 #if NCNN_BENCHMARK
         cmd.record_write_timestamp(layer_index * 2 + 1);
 #endif
@@ -703,11 +687,7 @@ int NetPrivate::do_forward_layer(const Layer* layer, std::vector<VkMat>& blob_ma
         int bottom_blob_index = layer->bottoms[0];
         int top_blob_index = layer->tops[0];
 
-        NET_HILOG("[NET] do_fwd1: layer=%s bottom_idx=%d top_idx=%d", layer->name.c_str(), bottom_blob_index, top_blob_index);
-
         VkMat& bottom_blob_ref = blob_mats_gpu[bottom_blob_index];
-
-        NET_HILOG("[NET] do_fwd1: bottom_blob_ref dims=%d data=%p refcount=%p", bottom_blob_ref.dims, (void*)bottom_blob_ref.data, (void*)bottom_blob_ref.refcount);
 
         VkMat bottom_blob;
 
@@ -716,9 +696,7 @@ int NetPrivate::do_forward_layer(const Layer* layer, std::vector<VkMat>& blob_ma
             // deep copy for inplace forward if data is shared
             if (layer->support_inplace && *bottom_blob_ref.refcount != 1)
             {
-                NET_HILOG("[NET] do_fwd1: record_clone start");
                 cmd.record_clone(bottom_blob_ref, bottom_blob, opt);
-                NET_HILOG("[NET] do_fwd1: record_clone done");
                 //                     NCNN_LOGE("clone %p[+%lu] %p[+%lu]", bottom_blob_ref.buffer(), bottom_blob_ref.buffer_offset(), bottom_blob.buffer(), bottom_blob.buffer_offset());
             }
         }
@@ -727,15 +705,11 @@ int NetPrivate::do_forward_layer(const Layer* layer, std::vector<VkMat>& blob_ma
             bottom_blob = bottom_blob_ref;
         }
 
-        NET_HILOG("[NET] do_fwd1: bottom_blob dims=%d data=%p inplace=%d lightmode=%d", bottom_blob.dims, (void*)bottom_blob.data, (int)layer->support_inplace, (int)opt.lightmode);
-
         // forward
         if (opt.lightmode && layer->support_inplace)
         {
             VkMat& bottom_top_blob = bottom_blob;
-            NET_HILOG("[NET] do_fwd1: calling forward_inplace");
             int ret = layer->forward_inplace(bottom_top_blob, cmd, opt);
-            NET_HILOG("[NET] do_fwd1: forward_inplace done ret=%d", ret);
             if (ret != 0)
                 return ret;
 
@@ -745,9 +719,7 @@ int NetPrivate::do_forward_layer(const Layer* layer, std::vector<VkMat>& blob_ma
         else
         {
             VkMat top_blob;
-            NET_HILOG("[NET] do_fwd1: calling forward(bottom, top)");
             int ret = layer->forward(bottom_blob, top_blob, cmd, opt);
-            NET_HILOG("[NET] do_fwd1: forward done ret=%d top_dims=%d top_data=%p", ret, top_blob.dims, (void*)top_blob.data);
             if (ret != 0)
                 return ret;
 

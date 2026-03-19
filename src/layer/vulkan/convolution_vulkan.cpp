@@ -6,19 +6,6 @@
 #include "layer_shader_type.h"
 #include "layer_type.h"
 
-// [PATCH] Conv forward tracing
-#ifdef __OHOS__
-#include <hilog/log.h>
-#define CONV_LOG(fmt, ...) do { \
-    char _cb[512]; \
-    snprintf(_cb, sizeof(_cb), fmt, ##__VA_ARGS__); \
-    OH_LOG_Print(LOG_APP, LOG_INFO, 0x3203, "NcnnConv", "%{public}s", _cb); \
-} while(0)
-#else
-#include <stdio.h>
-#define CONV_LOG(fmt, ...) fprintf(stderr, "[NcnnConv] " fmt "\n", ##__VA_ARGS__)
-#endif
-
 namespace ncnn {
 
 Convolution_vulkan::Convolution_vulkan()
@@ -1561,9 +1548,6 @@ int Convolution_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCom
     size_t elemsize = bottom_blob.elemsize;
     int elempack = bottom_blob.elempack;
 
-    CONV_LOG("conv::fwd ENTER w=%d h=%d c=%d elempack=%d padding=%d/%d/%d/%d",
-             w, h, channels, elempack, pad_left, pad_right, pad_top, pad_bottom);
-
     // flattened blob, implement as InnerProduct
     if (bottom_blob.dims == 1 && kernel_w == 1 && kernel_h == 1)
     {
@@ -1595,17 +1579,13 @@ int Convolution_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCom
     VkMat bottom_blob_bordered = bottom_blob;
     if (pad_left > 0 || pad_right > 0 || pad_top > 0 || pad_bottom > 0)
     {
-        CONV_LOG("conv::fwd padding explicit pad=%d/%d/%d/%d padding_ptr=%p", pad_left, pad_right, pad_top, pad_bottom, (void*)padding);
         if (!padding) {
-            CONV_LOG("conv::fwd FATAL: padding is NULL!");
             return -200;
         }
-        CONV_LOG("conv::fwd calling padding->forward...");
         Option opt_pad = opt;
         opt_pad.blob_vkallocator = opt.workspace_vkallocator;
 
         padding->forward(bottom_blob, bottom_blob_bordered, cmd, opt_pad);
-        CONV_LOG("conv::fwd padding done bordered dims=%d", bottom_blob_bordered.dims);
     }
     else if (pad_left == -233 && pad_right == -233 && pad_top == -233 && pad_bottom == -233)
     {
@@ -1673,8 +1653,6 @@ int Convolution_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCom
 
     const int maxk = kernel_w * kernel_h;
     const int num_input = channels * elempack;
-
-    CONV_LOG("conv::fwd after-pad w=%d h=%d outw=%d outh=%d out_elempack=%d num_input=%d num_output=%d", w, h, outw, outh, out_elempack, num_input, num_output);
 
     bool is_conv1x1s1d1 = kernel_w == 1 && kernel_h == 1 && stride_w == 1 && stride_h == 1 && dilation_w == 1 && dilation_h == 1;
     bool is_conv3x3s1d1 = kernel_w == 3 && kernel_h == 3 && stride_w == 1 && stride_h == 1 && dilation_w == 1 && dilation_h == 1;
@@ -2042,14 +2020,9 @@ int Convolution_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCom
 
         return 0;
     }
-
-    CONV_LOG("conv::fwd creating top_blob outw=%d outh=%d numout=%d vkallocator=%p", outw, outh, num_output / out_elempack, (void*)opt.blob_vkallocator);
     top_blob.create(outw, outh, num_output / out_elempack, out_elemsize, out_elempack, opt.blob_vkallocator);
-    CONV_LOG("conv::fwd top_blob created: empty=%d dims=%d data=%p", (int)top_blob.empty(), top_blob.dims, (void*)top_blob.data);
     if (top_blob.empty())
         return -100;
-
-    CONV_LOG("conv::fwd weight_data_gpu empty=%d bias empty=%d pipeline=%p", (int)weight_data_gpu.empty(), (int)bias_data_gpu.empty(), (void*)pipeline_convolution);
 
     std::vector<VkMat> bindings(4);
     bindings[0] = bottom_blob_bordered;
@@ -2073,10 +2046,7 @@ int Convolution_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCom
     dispatcher.w = (top_blob.w + 1) / 2;
     dispatcher.h = (top_blob.h + 1) / 2;
     dispatcher.c = (top_blob.c + 1) / 2;
-
-    CONV_LOG("conv::fwd calling record_pipeline_convolution dispatcher=(%d,%d,%d)", dispatcher.w, dispatcher.h, dispatcher.c);
     cmd.record_pipeline(pipeline_convolution, bindings, constants, dispatcher);
-    CONV_LOG("conv::fwd record_pipeline_convolution done");
 
     return 0;
 }
