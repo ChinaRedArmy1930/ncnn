@@ -8,6 +8,19 @@
 #include "option.h"
 #include "pipeline.h"
 
+// [PATCH] Use OH_LOG_Print so our debug logs appear in hilog (NCNN_LOGE → stderr on OHOS, invisible)
+#ifdef __OHOS__
+#include <hilog/log.h>
+#define PATCH_HILOG(fmt, ...) do { \
+    char _phbuf[512]; \
+    snprintf(_phbuf, sizeof(_phbuf), fmt, ##__VA_ARGS__); \
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0x3201, "NcnnPatch", "%{public}s", _phbuf); \
+} while(0)
+#else
+#include <stdio.h>
+#define PATCH_HILOG(fmt, ...) fprintf(stderr, "[NcnnPatch] " fmt "\n", ##__VA_ARGS__)
+#endif
+
 namespace ncnn {
 
 class VkComputePrivate
@@ -293,6 +306,7 @@ int VkComputePrivate::init()
 
     if (vkdev->info.support_VK_KHR_push_descriptor())
     {
+        PATCH_HILOG("[PATCH] VkComputePrivate::init: push_descriptor=TRUE, calling begin_command_buffer immediately");
         begin_command_buffer();
 
 #if NCNN_BENCHMARK
@@ -300,12 +314,17 @@ int VkComputePrivate::init()
             vkCmdResetQueryPool(compute_command_buffer, query_pool, 0, query_count);
 #endif // NCNN_BENCHMARK
     }
+    else
+    {
+        PATCH_HILOG("[PATCH] VkComputePrivate::init: push_descriptor=FALSE, begin_command_buffer deferred to submit_and_wait");
+    }
 
     return 0;
 }
 
 int VkComputePrivate::begin_command_buffer()
 {
+    PATCH_HILOG("[PATCH] begin_command_buffer: cmdbuf=%p", (void*)compute_command_buffer);
     VkCommandBufferBeginInfo commandBufferBeginInfo;
     commandBufferBeginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     commandBufferBeginInfo.pNext = 0;
@@ -315,10 +334,12 @@ int VkComputePrivate::begin_command_buffer()
     VkResult ret = vkBeginCommandBuffer(compute_command_buffer, &commandBufferBeginInfo);
     if (ret != VK_SUCCESS)
     {
+        PATCH_HILOG("[PATCH] begin_command_buffer: vkBeginCommandBuffer FAILED ret=%d", (int)ret);
         NCNN_LOGE("vkBeginCommandBuffer failed %d", ret);
         return -1;
     }
 
+    PATCH_HILOG("[PATCH] begin_command_buffer: OK");
     return 0;
 }
 
@@ -1223,7 +1244,28 @@ void VkCompute::record_pipeline(const Pipeline* pipeline, const std::vector<VkMa
 
 void VkCompute::record_pipeline(const Pipeline* pipeline, const std::vector<VkMat>& buffer_bindings, const std::vector<VkImageMat>& image_bindings, const std::vector<vk_constant_type>& constants, const Mat& dispatcher)
 {
-    //     NCNN_LOGE("record_pipeline %p", pipeline);
+    // [PATCH] Log every entry so we can confirm record_pipeline() is reached during ex.extract()
+    static int rp_call_count = 0;
+    rp_call_count++;
+    PATCH_HILOG("[PATCH] record_pipeline #%d ENTERED, pipeline=%p", rp_call_count, (void*)pipeline);
+
+    // [PATCH] Guard against null Pipeline* pointer.
+    // This can happen when a layer's create_pipeline() was never called (e.g. dynamic_weight path)
+    // or when the pipeline object failed to be allocated. Dereferencing NULL here causes SIGSEGV.
+    if (!pipeline)
+    {
+        PATCH_HILOG("[PATCH] record_pipeline: pipeline pointer is NULL, skipping GPU dispatch (layer may fall back to CPU)");
+        return;
+    }
+
+    // [PATCH] Guard against null VkPipeline handle inside the Pipeline object.
+    // This happens when vkCreateComputePipelines() failed (e.g. shader incompatible with Maleoon driver)
+    // but the Pipeline* object itself was created. Passing VK_NULL_HANDLE to vkCmdBindPipeline causes SIGSEGV.
+    if (!pipeline->pipeline())
+    {
+        PATCH_HILOG("[PATCH] record_pipeline: VkPipeline handle is VK_NULL_HANDLE (pipeline creation failed on this GPU driver), skipping GPU dispatch");
+        return;
+    }
 
     const int buffer_binding_count = (int)buffer_bindings.size();
     const int image_binding_count = (int)image_bindings.size();
@@ -1244,6 +1286,7 @@ void VkCompute::record_pipeline(const Pipeline* pipeline, const std::vector<VkMa
 
     int buffer_index = 0;
     int image_index = 0;
+    PATCH_HILOG("[PATCH] record_pipeline: binding_count=%d buf=%d img=%d const=%d", binding_count, buffer_binding_count, image_binding_count, constant_count);
     for (int i = 0; i < binding_count; i++)
     {
         int binding_type = shader_info.binding_types[i];
@@ -1253,18 +1296,32 @@ void VkCompute::record_pipeline(const Pipeline* pipeline, const std::vector<VkMa
             const VkMat& binding = buffer_bindings[buffer_index].empty() ? vkdev->get_dummy_buffer() : buffer_bindings[buffer_index];
             buffer_index++;
 
-            //             NCNN_LOGE("binding #%d buffer = %d %d %d %d @ %lu %d = %p +%ld ~%ld", i, binding.dims, binding.w, binding.h, binding.c, binding.elemsize, binding.elempack, binding.buffer(), binding.buffer_offset(), binding.buffer_capacity());
-
+            // [PATCH] Guard against null binding.data before barrier_readwrite
+            PATCH_HILOG("[PATCH] rp_bind[%d]: type=VkMat empty=%d data=%p", i, (int)buffer_bindings[buffer_index-1].empty(), (void*)binding.data);
+            if (!binding.data)
+            {
+                PATCH_HILOG("[PATCH] rp_bind[%d]: VkMat data NULL, skipping barrier", i);
+                continue;
+            }
+            PATCH_HILOG("[PATCH] rp_bind[%d]: calling barrier_readwrite_mat...", i);
             barrier_readwrite(binding);
+            PATCH_HILOG("[PATCH] rp_bind[%d]: barrier_readwrite_mat done", i);
         }
         else if (binding_type == 2)
         {
             const VkImageMat& binding = image_bindings[image_index].empty() ? vkdev->get_dummy_image() : image_bindings[image_index];
             image_index++;
 
-            //             NCNN_LOGE("binding #%d image = %d %d %d %d @ %lu %d = %p +%ld ~%ld %p", i, binding.dims, binding.w, binding.h, binding.c, binding.elemsize, binding.elempack, binding.image(), binding.data->bind_offset, binding.data->bind_capacity, binding.imageview());
-
+            // [PATCH] Guard against null binding.data before barrier_readwrite
+            PATCH_HILOG("[PATCH] rp_bind[%d]: type=VkImageMat empty=%d data=%p", i, (int)image_bindings[image_index-1].empty(), (void*)binding.data);
+            if (!binding.data)
+            {
+                PATCH_HILOG("[PATCH] rp_bind[%d]: VkImageMat data NULL, skipping barrier", i);
+                continue;
+            }
+            PATCH_HILOG("[PATCH] rp_bind[%d]: calling barrier_readwrite_imgmat...", i);
             barrier_readwrite(binding);
+            PATCH_HILOG("[PATCH] rp_bind[%d]: barrier_readwrite_imgmat done", i);
 
             // image and imageview can not be destroyed until command execution ends
             NCNN_XADD(&binding.data->command_refcount, 1);
@@ -1275,7 +1332,13 @@ void VkCompute::record_pipeline(const Pipeline* pipeline, const std::vector<VkMa
             const VkImageMat& binding = image_bindings[image_index].empty() ? vkdev->get_dummy_image_readonly() : image_bindings[image_index];
             image_index++;
 
-            //             NCNN_LOGE("binding #%d sampler = %d %d %d %d @ %lu %d = %p +%ld ~%ld %p", i, binding.dims, binding.w, binding.h, binding.c, binding.elemsize, binding.elempack, binding.image(), binding.data->bind_offset, binding.data->bind_capacity, binding.imageview());
+            // [PATCH] Guard against null binding.data before barrier_readonly
+            PATCH_HILOG("[PATCH] rp_bind[%d]: type=VkImageMat(sampler) empty=%d data=%p", i, (int)image_bindings[image_index-1].empty(), (void*)binding.data);
+            if (!binding.data)
+            {
+                PATCH_HILOG("[PATCH] rp_bind[%d]: VkImageMat(sampler) data NULL, skipping barrier", i);
+                continue;
+            }
 
             // if the same image used for both storage image and combined image sampler
             // only apply image layout transition to general
@@ -1292,28 +1355,35 @@ void VkCompute::record_pipeline(const Pipeline* pipeline, const std::vector<VkMa
             if (image_read_write)
                 continue;
 
+            PATCH_HILOG("[PATCH] rp_bind[%d]: calling barrier_readonly_imgmat...", i);
             barrier_readonly(binding);
+            PATCH_HILOG("[PATCH] rp_bind[%d]: barrier_readonly_imgmat done", i);
 
             // image and imageview can not be destroyed until command execution ends
             NCNN_XADD(&binding.data->command_refcount, 1);
             d->image_blocks_to_destroy.push_back(binding.data);
         }
     }
+    PATCH_HILOG("[PATCH] record_pipeline: binding loop done, proceeding to bind_pipeline");
 
     // record bind pipeline
     {
         if (vkdev->info.support_VK_KHR_push_descriptor())
         {
+            PATCH_HILOG("[PATCH] push_desc: vkCmdBindPipeline start, pipeline=%p", (void*)pipeline->pipeline());
             vkCmdBindPipeline(d->compute_command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline());
+            PATCH_HILOG("[PATCH] push_desc: vkCmdBindPipeline OK");
         }
         else
         {
+            PATCH_HILOG("[PATCH] delayed: push TYPE_bind_pipeline, pipeline=%p", (void*)pipeline->pipeline());
             VkComputePrivate::record r;
             r.type = VkComputePrivate::record::TYPE_bind_pipeline;
             r.command_buffer = d->compute_command_buffer;
             r.bind_pipeline.bind_point = VK_PIPELINE_BIND_POINT_COMPUTE;
             r.bind_pipeline.pipeline = pipeline->pipeline();
             d->delayed_records.push_back(r);
+            PATCH_HILOG("[PATCH] delayed: TYPE_bind_pipeline pushed OK");
         }
     }
 
@@ -1363,7 +1433,9 @@ void VkCompute::record_pipeline(const Pipeline* pipeline, const std::vector<VkMa
 
         if (vkdev->info.support_VK_KHR_push_descriptor())
         {
+            PATCH_HILOG("[PATCH] push_desc: vkCmdPushDescriptorSetWithTemplateKHR start, tmpl=%p layout=%p", (void*)pipeline->descriptor_update_template(), (void*)pipeline->pipeline_layout());
             vkdev->vkCmdPushDescriptorSetWithTemplateKHR(d->compute_command_buffer, pipeline->descriptor_update_template(), pipeline->pipeline_layout(), 0, descriptorInfos.data());
+            PATCH_HILOG("[PATCH] push_desc: vkCmdPushDescriptorSetWithTemplateKHR OK");
         }
         else
         {
@@ -1398,12 +1470,15 @@ void VkCompute::record_pipeline(const Pipeline* pipeline, const std::vector<VkMa
                 descriptorPoolCreateInfo.poolSizeCount = 3;
                 descriptorPoolCreateInfo.pPoolSizes = poolSizes;
 
+                PATCH_HILOG("[PATCH] delayed: vkCreateDescriptorPool start (buf=%d img=%d sampler=%d)", buffer_binding_count, image_binding_count, sampler_binding_count);
                 VkResult ret = vkCreateDescriptorPool(vkdev->vkdevice(), &descriptorPoolCreateInfo, 0, &descriptor_pool);
                 if (ret != VK_SUCCESS)
                 {
+                    PATCH_HILOG("[PATCH] delayed: vkCreateDescriptorPool FAILED ret=%d", (int)ret);
                     NCNN_LOGE("vkCreateDescriptorPool failed %d", ret);
                     return;
                 }
+                PATCH_HILOG("[PATCH] delayed: vkCreateDescriptorPool OK pool=%p", (void*)descriptor_pool);
             }
             d->descriptor_pools.push_back(descriptor_pool);
 
@@ -1411,6 +1486,7 @@ void VkCompute::record_pipeline(const Pipeline* pipeline, const std::vector<VkMa
             {
                 VkDescriptorSetLayout descriptorset_layout = pipeline->descriptorset_layout();
 
+                PATCH_HILOG("[PATCH] delayed: vkAllocateDescriptorSets start, layout=%p", (void*)descriptorset_layout);
                 VkDescriptorSetAllocateInfo descriptorSetAllocateInfo;
                 descriptorSetAllocateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
                 descriptorSetAllocateInfo.pNext = 0;
@@ -1421,17 +1497,33 @@ void VkCompute::record_pipeline(const Pipeline* pipeline, const std::vector<VkMa
                 VkResult ret = vkAllocateDescriptorSets(vkdev->vkdevice(), &descriptorSetAllocateInfo, &descriptorset);
                 if (ret != VK_SUCCESS)
                 {
+                    PATCH_HILOG("[PATCH] delayed: vkAllocateDescriptorSets FAILED ret=%d", (int)ret);
                     NCNN_LOGE("vkAllocateDescriptorSets failed %d", ret);
                     return;
                 }
+                PATCH_HILOG("[PATCH] delayed: vkAllocateDescriptorSets OK set=%p", (void*)descriptorset);
             }
             d->descriptorsets.push_back(descriptorset);
 
+            // [PATCH] Use bool flag instead of goto to avoid jumping over declarations
+            bool descriptors_updated = false;
             if (vkdev->info.support_VK_KHR_descriptor_update_template())
             {
-                vkdev->vkUpdateDescriptorSetWithTemplateKHR(vkdev->vkdevice(), descriptorset, pipeline->descriptor_update_template(), descriptorInfos.data());
+                // [PATCH] Check for null descriptor_update_template (common on Maleoon where template creation fails silently)
+                VkDescriptorUpdateTemplateKHR tmpl = pipeline->descriptor_update_template();
+                PATCH_HILOG("[PATCH] delayed: vkUpdateDescriptorSetWithTemplateKHR start, tmpl=%p set=%p", (void*)tmpl, (void*)descriptorset);
+                if (tmpl)
+                {
+                    vkdev->vkUpdateDescriptorSetWithTemplateKHR(vkdev->vkdevice(), descriptorset, tmpl, descriptorInfos.data());
+                    PATCH_HILOG("[PATCH] delayed: vkUpdateDescriptorSetWithTemplateKHR OK");
+                    descriptors_updated = true;
+                }
+                else
+                {
+                    PATCH_HILOG("[PATCH] delayed: descriptor_update_template is VK_NULL_HANDLE! Falling back to vkUpdateDescriptorSets.");
+                }
             }
-            else
+            if (!descriptors_updated)
             {
                 std::vector<VkWriteDescriptorSet> writeDescriptorSets(binding_count);
                 {
@@ -1475,9 +1567,12 @@ void VkCompute::record_pipeline(const Pipeline* pipeline, const std::vector<VkMa
                     }
                 }
 
+                PATCH_HILOG("[PATCH] delayed: vkUpdateDescriptorSets start, count=%d", binding_count);
                 vkUpdateDescriptorSets(vkdev->vkdevice(), binding_count, writeDescriptorSets.data(), 0, 0);
+                PATCH_HILOG("[PATCH] delayed: vkUpdateDescriptorSets OK");
             }
 
+            PATCH_HILOG("[PATCH] delayed: push TYPE_bind_descriptorsets, layout=%p offset=%d", (void*)pipeline->pipeline_layout(), (int)(d->descriptorsets.size() - 1));
             VkComputePrivate::record r;
             r.type = VkComputePrivate::record::TYPE_bind_descriptorsets;
             r.command_buffer = d->compute_command_buffer;
@@ -1486,15 +1581,19 @@ void VkCompute::record_pipeline(const Pipeline* pipeline, const std::vector<VkMa
             r.bind_descriptorsets.descriptorset_count = 1;
             r.bind_descriptorsets.descriptorset_offset = d->descriptorsets.size() - 1;
             d->delayed_records.push_back(r);
+            PATCH_HILOG("[PATCH] delayed: TYPE_bind_descriptorsets pushed OK");
         }
     }
 
     // record push constants
+    PATCH_HILOG("[PATCH] record_pipeline: proceeding to push_constants, constant_count=%d", constant_count);
     if (constant_count > 0)
     {
         if (vkdev->info.support_VK_KHR_push_descriptor())
         {
+            PATCH_HILOG("[PATCH] push_desc: vkCmdPushConstants start, count=%d", constant_count);
             vkCmdPushConstants(d->compute_command_buffer, pipeline->pipeline_layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, constant_count * sizeof(vk_constant_type), constants.data());
+            PATCH_HILOG("[PATCH] push_desc: vkCmdPushConstants OK");
         }
         else
         {
@@ -1502,6 +1601,7 @@ void VkCompute::record_pipeline(const Pipeline* pipeline, const std::vector<VkMa
             unsigned char* constant_values = new unsigned char[size];
             memcpy(constant_values, constants.data(), size);
 
+            PATCH_HILOG("[PATCH] delayed: push TYPE_push_constants, size=%u", size);
             VkComputePrivate::record r;
             r.type = VkComputePrivate::record::TYPE_push_constants;
             r.command_buffer = d->compute_command_buffer;
@@ -1510,6 +1610,7 @@ void VkCompute::record_pipeline(const Pipeline* pipeline, const std::vector<VkMa
             r.push_constants.size = size;
             r.push_constants.values = constant_values;
             d->delayed_records.push_back(r);
+            PATCH_HILOG("[PATCH] delayed: TYPE_push_constants pushed OK");
         }
     }
 
@@ -1519,12 +1620,16 @@ void VkCompute::record_pipeline(const Pipeline* pipeline, const std::vector<VkMa
         uint32_t group_count_y = (dispatcher.h * (dispatcher.d ? dispatcher.d : 1) + pipeline->local_size_y() - 1) / pipeline->local_size_y();
         uint32_t group_count_z = (dispatcher.c + pipeline->local_size_z() - 1) / pipeline->local_size_z();
 
+        PATCH_HILOG("[PATCH] record_pipeline: proceeding to dispatch, groups=(%u,%u,%u)", group_count_x, group_count_y, group_count_z);
         if (vkdev->info.support_VK_KHR_push_descriptor())
         {
+            PATCH_HILOG("[PATCH] push_desc: vkCmdDispatch start, groups=(%u,%u,%u)", group_count_x, group_count_y, group_count_z);
             vkCmdDispatch(d->compute_command_buffer, group_count_x, group_count_y, group_count_z);
+            PATCH_HILOG("[PATCH] push_desc: vkCmdDispatch OK");
         }
         else
         {
+            PATCH_HILOG("[PATCH] delayed: push TYPE_dispatch groups=(%u,%u,%u)", group_count_x, group_count_y, group_count_z);
             VkComputePrivate::record r;
             r.type = VkComputePrivate::record::TYPE_dispatch;
             r.command_buffer = d->compute_command_buffer;
@@ -1532,8 +1637,10 @@ void VkCompute::record_pipeline(const Pipeline* pipeline, const std::vector<VkMa
             r.dispatch.group_count_y = group_count_y;
             r.dispatch.group_count_z = group_count_z;
             d->delayed_records.push_back(r);
+            PATCH_HILOG("[PATCH] delayed: TYPE_dispatch pushed OK");
         }
     }
+    PATCH_HILOG("[PATCH] record_pipeline: COMPLETE (all records pushed)");
 }
 
 #if NCNN_BENCHMARK
@@ -1784,6 +1891,10 @@ int VkCompute::submit_and_wait()
 {
     //     NCNN_LOGE("submit_and_wait");
 
+    PATCH_HILOG("[PATCH] submit_and_wait: delayed_records=%d, support_push_descriptor=%d",
+              (int)d->delayed_records.size(),
+              (int)vkdev->info.support_VK_KHR_push_descriptor());
+
     if (!vkdev->info.support_VK_KHR_push_descriptor())
     {
         d->begin_command_buffer();
@@ -1828,7 +1939,14 @@ int VkCompute::submit_and_wait()
             }
             case VkComputePrivate::record::TYPE_bind_pipeline:
             {
+                PATCH_HILOG("[PATCH] delayed replay: vkCmdBindPipeline pipeline=%p", (void*)r.bind_pipeline.pipeline);
+                if (!r.bind_pipeline.pipeline)
+                {
+                    PATCH_HILOG("[PATCH] delayed replay: vkCmdBindPipeline pipeline is VK_NULL_HANDLE, SKIPPING to avoid crash");
+                    break;
+                }
                 vkCmdBindPipeline(r.command_buffer, r.bind_pipeline.bind_point, r.bind_pipeline.pipeline);
+                PATCH_HILOG("[PATCH] delayed replay: vkCmdBindPipeline OK");
                 break;
             }
             case VkComputePrivate::record::TYPE_bind_descriptorsets:
@@ -1844,7 +1962,9 @@ int VkCompute::submit_and_wait()
             }
             case VkComputePrivate::record::TYPE_dispatch:
             {
+                PATCH_HILOG("[PATCH] delayed replay: vkCmdDispatch group=(%u,%u,%u)", r.dispatch.group_count_x, r.dispatch.group_count_y, r.dispatch.group_count_z);
                 vkCmdDispatch(r.command_buffer, r.dispatch.group_count_x, r.dispatch.group_count_y, r.dispatch.group_count_z);
+                PATCH_HILOG("[PATCH] delayed replay: vkCmdDispatch OK");
                 break;
             }
             case VkComputePrivate::record::TYPE_memory_barrers:
@@ -1907,13 +2027,15 @@ int VkCompute::submit_and_wait()
         submitInfo.signalSemaphoreCount = 0;
         submitInfo.pSignalSemaphores = 0;
 
+        PATCH_HILOG("[PATCH] vkQueueSubmit → submitting %d delayed records to GPU...", (int)d->delayed_records.size());
         VkResult ret = vkQueueSubmit(compute_queue, 1, &submitInfo, d->compute_command_fence);
         if (ret != VK_SUCCESS)
         {
-            NCNN_LOGE("vkQueueSubmit failed %d", ret);
+            PATCH_HILOG("[PATCH] vkQueueSubmit FAILED: VkResult=%d (delayed_records=%d)", (int)ret, (int)d->delayed_records.size());
             vkdev->reclaim_queue(vkdev->info.compute_queue_family_index(), compute_queue);
             return -1;
         }
+        PATCH_HILOG("[PATCH] vkQueueSubmit OK, waiting for GPU fence...");
     }
 
     vkdev->reclaim_queue(vkdev->info.compute_queue_family_index(), compute_queue);
@@ -1923,9 +2045,10 @@ int VkCompute::submit_and_wait()
         VkResult ret = vkWaitForFences(vkdev->vkdevice(), 1, &d->compute_command_fence, VK_TRUE, (uint64_t)-1);
         if (ret != VK_SUCCESS)
         {
-            NCNN_LOGE("vkWaitForFences failed %d", ret);
+            PATCH_HILOG("[PATCH] vkWaitForFences FAILED: VkResult=%d (this usually means VK_ERROR_DEVICE_LOST=-4, GPU crashed during shader execution)", (int)ret);
             return -1;
         }
+        PATCH_HILOG("[PATCH] vkWaitForFences OK, GPU execution completed successfully!");
     }
 
     // handle delayed post records
@@ -2091,6 +2214,7 @@ int VkCompute::get_query_pool_results(uint32_t first_query, uint32_t query_count
 
 void VkCompute::barrier_readwrite(const VkMat& binding)
 {
+    PATCH_HILOG("[PATCH] barrier_rw_mat: data=%p buf=%p access=0x%x stage=0x%x", (void*)binding.data, (void*)binding.buffer(), binding.data->access_flags, binding.data->stage_flags);
     if (binding.data->access_flags & VK_ACCESS_SHADER_WRITE_BIT || binding.data->stage_flags != VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
     {
         // barrier device any @ compute/null to shader-readwrite @ compute
@@ -2110,11 +2234,13 @@ void VkCompute::barrier_readwrite(const VkMat& binding)
 
         if (vkdev->info.support_VK_KHR_push_descriptor())
         {
+            PATCH_HILOG("[PATCH] barrier_rw_mat: vkCmdPipelineBarrier (push_desc path)");
             vkCmdPipelineBarrier(d->compute_command_buffer, src_stage, dst_stage, 0, 0, 0, 1, barriers, 0, 0);
             delete[] barriers;
         }
         else
         {
+            PATCH_HILOG("[PATCH] barrier_rw_mat: push to delayed_records");
             VkComputePrivate::record r;
             r.type = VkComputePrivate::record::TYPE_buffer_barrers;
             r.command_buffer = d->compute_command_buffer;
@@ -2126,13 +2252,20 @@ void VkCompute::barrier_readwrite(const VkMat& binding)
         }
 
         // mark device shader-readwrite @ compute
+        PATCH_HILOG("[PATCH] barrier_rw_mat: marking access_flags+stage_flags");
         binding.data->access_flags = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         binding.data->stage_flags = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        PATCH_HILOG("[PATCH] barrier_rw_mat: done");
+    }
+    else
+    {
+        PATCH_HILOG("[PATCH] barrier_rw_mat: condition false, no barrier needed");
     }
 }
 
 void VkCompute::barrier_readwrite(const VkImageMat& binding)
 {
+    PATCH_HILOG("[PATCH] barrier_rw_img: data=%p image=%p access=0x%x layout=%d stage=0x%x", (void*)binding.data, (void*)binding.image(), binding.data->access_flags, (int)binding.data->image_layout, binding.data->stage_flags);
     if (binding.data->access_flags & VK_ACCESS_SHADER_WRITE_BIT || binding.data->image_layout != VK_IMAGE_LAYOUT_GENERAL || binding.data->stage_flags != VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
     {
         // image layout transform any @ any to shader-write @ compute
@@ -2173,14 +2306,21 @@ void VkCompute::barrier_readwrite(const VkImageMat& binding)
         }
 
         // mark image shader-write @ compute
+        PATCH_HILOG("[PATCH] barrier_rw_img: marking flags");
         binding.data->access_flags = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         binding.data->image_layout = VK_IMAGE_LAYOUT_GENERAL;
         binding.data->stage_flags = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        PATCH_HILOG("[PATCH] barrier_rw_img: done");
+    }
+    else
+    {
+        PATCH_HILOG("[PATCH] barrier_rw_img: condition false, no barrier needed");
     }
 }
 
 void VkCompute::barrier_readonly(const VkImageMat& binding)
 {
+    PATCH_HILOG("[PATCH] barrier_ro_img: data=%p image=%p access=0x%x layout=%d stage=0x%x", (void*)binding.data, (void*)binding.image(), binding.data->access_flags, (int)binding.data->image_layout, binding.data->stage_flags);
     if (binding.data->access_flags & VK_ACCESS_SHADER_WRITE_BIT || binding.data->image_layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL || binding.data->stage_flags != VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
     {
         // image layout transform any @ any to shader-readonly-optimal @ compute
@@ -2221,9 +2361,15 @@ void VkCompute::barrier_readonly(const VkImageMat& binding)
         }
 
         // mark image shader-readonly-optimal @ compute
+        PATCH_HILOG("[PATCH] barrier_ro_img: marking flags");
         binding.data->access_flags = VK_ACCESS_SHADER_READ_BIT;
         binding.data->image_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         binding.data->stage_flags = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        PATCH_HILOG("[PATCH] barrier_ro_img: done");
+    }
+    else
+    {
+        PATCH_HILOG("[PATCH] barrier_ro_img: condition false, no barrier needed");
     }
 }
 

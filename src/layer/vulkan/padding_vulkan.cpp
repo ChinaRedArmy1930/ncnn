@@ -5,6 +5,19 @@
 
 #include "layer_shader_type.h"
 
+// [PATCH] Padding forward tracing
+#ifdef __OHOS__
+#include <hilog/log.h>
+#define PAD_LOG(fmt, ...) do { \
+    char _pb[512]; \
+    snprintf(_pb, sizeof(_pb), fmt, ##__VA_ARGS__); \
+    OH_LOG_Print(LOG_APP, LOG_INFO, 0x3204, "NcnnPad", "%{public}s", _pb); \
+} while(0)
+#else
+#include <stdio.h>
+#define PAD_LOG(fmt, ...) fprintf(stderr, "[NcnnPad] " fmt "\n", ##__VA_ARGS__)
+#endif
+
 namespace ncnn {
 
 Padding_vulkan::Padding_vulkan()
@@ -250,6 +263,8 @@ int Padding_vulkan::upload_model(VkTransfer& cmd, const Option& opt)
 
 int Padding_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute& cmd, const Option& opt) const
 {
+    PAD_LOG("pad::fwd ENTER dims=%d data=%p refcount=%p", bottom_blob.dims, (void*)bottom_blob.data, (void*)bottom_blob.refcount);
+
     int dims = bottom_blob.dims;
     int w = bottom_blob.w;
     int h = bottom_blob.h;
@@ -257,6 +272,9 @@ int Padding_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute
     int channels = bottom_blob.c;
     size_t elemsize = bottom_blob.elemsize;
     int elempack = bottom_blob.elempack;
+
+    PAD_LOG("pad::fwd dims=%d w=%d h=%d c=%d elempack=%d pad=top%d/bot%d/L%d/R%d/f%d/b%d",
+            dims, w, h, channels, elempack, top, bottom, left, right, front, behind);
 
     int outw = 0;
     int outh = 0;
@@ -325,16 +343,21 @@ int Padding_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute
 
     size_t out_elemsize = elemsize / elempack * out_elempack;
 
+    PAD_LOG("pad::fwd outw=%d outh=%d outc=%d out_elempack=%d offset_elempack=%d", outw, outh, outc, out_elempack, offset_elempack);
     // unpacking
     VkMat bottom_blob_unpacked = bottom_blob;
+    PAD_LOG("pad::fwd after copy-assign unpacked data=%p", (void*)bottom_blob_unpacked.data);
     if (elempack > offset_elempack)
     {
+        PAD_LOG("pad::fwd calling convert_packing %d->%d", elempack, offset_elempack);
         Option opt_pack1 = opt;
         opt_pack1.blob_vkallocator = opt.workspace_vkallocator;
 
         vkdev->convert_packing(bottom_blob, bottom_blob_unpacked, offset_elempack, cmd, opt_pack1);
+        PAD_LOG("pad::fwd convert_packing done");
     }
 
+    PAD_LOG("pad::fwd creating top_blob allocator=%p", (void*)opt.blob_vkallocator);
     if (dims == 1)
     {
         top_blob.create(outw / out_elempack, out_elemsize, out_elempack, opt.blob_vkallocator);
@@ -351,6 +374,7 @@ int Padding_vulkan::forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute
     {
         top_blob.create(outw, outh, outd, outc / out_elempack, out_elemsize, out_elempack, opt.blob_vkallocator);
     }
+    PAD_LOG("pad::fwd top_blob created: empty=%d data=%p", (int)top_blob.empty(), (void*)top_blob.data);
     if (top_blob.empty())
         return -100;
 

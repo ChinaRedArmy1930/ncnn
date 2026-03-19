@@ -5,6 +5,15 @@
 
 #if NCNN_VULKAN
 
+// [PATCH] Use OH_LOG_Print so our debug logs appear in hilog (NCNN_LOGE → stderr on OHOS, invisible)
+#ifdef __OHOS__
+#include <hilog/log.h>
+#define PATCH_HILOG(fmt, ...) OH_LOG_Print(LOG_APP, LOG_INFO, 0x3201, "NcnnPatch", fmt, ##__VA_ARGS__)
+#else
+#include <stdio.h>
+#define PATCH_HILOG(fmt, ...) fprintf(stderr, "[NcnnPatch] " fmt "\n", ##__VA_ARGS__)
+#endif
+
 #include <float.h>
 #include <limits.h>
 #include <stdlib.h>
@@ -3846,7 +3855,14 @@ int VulkanDevice::create_pipeline(VkShaderModule shader_module, VkPipelineLayout
     VkResult ret = vkCreateComputePipelines(d->device, 0, 1, &computePipelineCreateInfo, 0, pipeline);
     if (ret != VK_SUCCESS)
     {
-        NCNN_LOGE("vkCreateComputePipelines failed %d", ret);
+        // [PATCH] Print detailed Vulkan error info to help diagnose Maleoon/HiSilicon driver incompatibility.
+        // VkResult codes: -1=VK_ERROR_OUT_OF_HOST_MEMORY, -2=VK_ERROR_OUT_OF_DEVICE_MEMORY,
+        //                 -4=VK_ERROR_DEVICE_LOST, -11=VK_ERROR_FEATURE_NOT_PRESENT,
+        //                 -1000298000=VK_ERROR_INVALID_SHADER_NV
+        PATCH_HILOG("[PATCH] vkCreateComputePipelines FAILED: VkResult=%d (subgroup_size=%u, shader_module=%p, pipeline_layout=%p)",
+                  (int)ret, subgroup_size, (void*)shader_module, (void*)pipeline_layout);
+        PATCH_HILOG("[PATCH]   This likely means the SPIR-V shader is incompatible with the current GPU driver (e.g. Maleoon).");
+        PATCH_HILOG("[PATCH]   GPU dispatch for this layer will be skipped (record_pipeline null guard active).");
         return -1;
     }
 
